@@ -128,11 +128,34 @@ def test_alignment_distance_threshold_and_empty_nonincreasing_or_gapped_times():
     assert result.alignment_status.iloc[2] != "aligned"
 
 
-def test_disconnected_route_is_rejected():
+def test_disconnected_route_is_aligned_and_break_is_counted():
+    # Raw routes sometimes skip a short piece of road. The order is still known, so the
+    # trip keeps its labels and the break is reported instead of the trip being dropped.
     nodes, arcs = network()
-    with pytest.raises(ValueError, match="disconnected"):
-        assign_point_ground_truth("t", pd.DataFrame({"gps_lon": [0.], "gps_lat": [0.], "timestamp": [0.]}),
-                                  pd.DataFrame({"arc_id": [0, 3]}), nodes, arcs)
+    track = pd.DataFrame({"gps_lon": [.0002, .0018], "gps_lat": [0., 0.], "timestamp": [0., 1.]})
+    result = assign_point_ground_truth("t", track, pd.DataFrame({"arc_id": [0, 3]}), nodes, arcs)
+    assert result.attrs["route_breaks"] == 1
+    assert result.alignment_status.eq("aligned").all()
+    assert result.reference_route_order.is_monotonic_increasing
+
+
+def test_long_arc_does_not_trap_the_alignment():
+    # A 1 km first arc followed by short arcs: points must move on to the later arcs.
+    nodes = pd.DataFrame({"lon": [0., .01, .0105, .011], "lat": [0., 0., 0., 0.]})
+    arcs = pd.DataFrame({"from_node_id": [0, 1, 2], "to_node_id": [1, 2, 3]})
+    track = pd.DataFrame({"gps_lon": [.009, .0095, .0102, .0107], "gps_lat": [.00002] * 4,
+                          "timestamp": [0., 1., 2., 3.]})
+    result = assign_point_ground_truth("t", track, pd.DataFrame({"arc_id": [0, 1, 2]}), nodes, arcs)
+    assert result.true_arc_id.tolist() == [0, 0, 1, 2]
+
+
+def test_heading_picks_the_direction_of_travel_on_a_two_way_street():
+    # Arcs 0 (east) and 1 (west) share the same geometry; the vehicle drives west.
+    nodes = pd.DataFrame({"lon": [0., .002], "lat": [0., 0.]})
+    arcs = pd.DataFrame({"from_node_id": [0, 1], "to_node_id": [1, 0]})
+    track = pd.DataFrame({"gps_lon": [.0015, .0010, .0005], "gps_lat": [.00001] * 3, "timestamp": [0., 1., 2.]})
+    result = assign_point_ground_truth("t", track, pd.DataFrame({"arc_id": [0, 1]}), nodes, arcs)
+    assert result.true_arc_id.tolist() == [1, 1, 1]
 
 
 def test_long_segment_midpoint_reverse_arc_and_zero_length_are_retrieved():

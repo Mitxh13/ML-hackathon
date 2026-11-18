@@ -26,7 +26,8 @@ def run_partition(data_dir: Path, partition: str, output_dir: Path,
         if missing:
             raise ValueError(f"{trip_id}: missing trip files {sorted(missing)}")
         alignment = assign_point_ground_truth(trip_id, trip["track"], trip["route"], trip["nodes"], trip["arcs"])
-        candidates = generator.generate_candidates(trip_id, trip["track"], trip["nodes"], trip["arcs"], alignment)
+        candidates = generator.generate_candidates(trip_id, trip["track"], trip["nodes"], trip["arcs"], alignment,
+                                                 include_section12_fields=True)
         # Persist the Section 1.2 name while retaining true_arc_id in the shared API.
         alignment = alignment.rename(columns={"true_arc_id": "reference_arc_id"})
         alignments.append(alignment)

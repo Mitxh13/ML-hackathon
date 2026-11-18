@@ -21,6 +21,15 @@ class CandidateGenerator:
         self.expand_radius = bool(expand_radius)
 
     @staticmethod
+    def _pair_distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Exact distance from points[i] to segment (a[i], b[i]), row by row, in metres."""
+        ab = b - a
+        denom = np.einsum("ij,ij->i", ab, ab)
+        frac = np.einsum("ij,ij->i", points - a, ab) / np.where(denom == 0, 1, denom)
+        closest = a + np.clip(frac, 0, 1)[:, None] * ab
+        return np.linalg.norm(points - closest, axis=1)
+
+    @staticmethod
     def _distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         ab = b-a
         denom = np.einsum("ij,ij->i", ab, ab)
@@ -57,50 +66,76 @@ class CandidateGenerator:
         half_lengths = np.linalg.norm(b-a, axis=1)/2
         tree = cKDTree(centers)
         gps = np.column_stack(transformer.transform(track_lon, track_lat))
+        n_obs = len(gps)
+        obs_ids = (track_df["obs_idx"].to_numpy(int) if "obs_idx" in track_df.columns
+                   else np.arange(n_obs))
         gt = {}
         if point_gt_df is not None and "reference_arc_id" in point_gt_df:
             gt = dict(zip(point_gt_df.obs_idx, point_gt_df.reference_arc_id))
         elif point_gt_df is not None and "true_arc_id" in point_gt_df:
             gt = dict(zip(point_gt_df.obs_idx, point_gt_df.true_arc_id))
-        records = []
-        for i, (obs, point) in enumerate(zip(track_df.itertuples(index=False), gps)):
-            obs_idx = int(getattr(obs, "obs_idx", i))
-            truth = gt.get(obs_idx, pd.NA)
-            if pd.isna(truth):
-                truth = pd.NA
-            radius = min(max(self.max_dist_m, self.min_radius_m), self.max_radius_m)
-            chosen_ids, distances, fallback = np.array([], dtype=int), np.array([]), False
-            while True:
-                # Midpoint distance <= search radius + segment half length is a safe broad phase.
-                nearby = tree.query_ball_point(point, radius + half_lengths.max())
-                ids = np.asarray([j for j in nearby if np.linalg.norm(point-centers[j]) <= radius + half_lengths[j]], dtype=int)
-                if len(ids):
-                    d = self._distance(point.reshape(1, 2), a[ids], b[ids])[0]
-                    mask = d <= radius
-                    ids, d = ids[mask], d[mask]
-                    order = np.lexsort((ids, d))
-                    chosen_ids, distances = ids[order][:self.max_k], d[order][:self.max_k]
-                if len(chosen_ids) or not self.expand_radius or radius >= self.max_radius_m:
-                    break
-                radius = min(self.max_radius_m, radius * 2)
-            if len(chosen_ids) == 0:
-                # Keep an explicit nearest-road fallback; the summary records its use.
-                _, nearest = tree.query(point, k=1)
-                chosen_ids = np.array([int(nearest)])
-                distances = self._distance(point.reshape(1, 2), a[chosen_ids], b[chosen_ids])[0]
-                fallback = True
-            for rank, (arc_id, distance) in enumerate(zip(chosen_ids, distances), start=1):
-                label = int(arc_id == int(truth)) if not pd.isna(truth) else -1
-                record = {"trip_id": str(trip_id), "obs_idx": obs_idx,
-                    "timestamp": float(obs.timestamp), "gps_lon": float(obs.gps_lon), "gps_lat": float(obs.gps_lat),
-                    "candidate_arc_id": int(arc_id), "from_node_id": int(endpoints[arc_id, 0]),
-                    "to_node_id": int(endpoints[arc_id, 1]), "dist_to_arc_m": float(distance),
-                    "is_target": label}
-                if include_section12_fields:
-                    record.update({"candidate_rank": rank, "reference_arc_id": truth,
-                    "is_reference": (bool(label == 1) if label >= 0 else pd.NA), "distance_m": float(distance),
-                    "label": label, "fallback_used": fallback})
-                records.append(record)
+
+        # All points are searched at once. A point keeps the (up to max_k) arcs whose exact
+        # point-to-segment distance is within its radius, ordered by (distance, arc_id).
+        # Points with nothing in range retry with a doubled radius (up to max_radius_m).
+        chosen_pt, chosen_arc, chosen_d = [], [], []
+        radius = np.full(n_obs, min(max(self.max_dist_m, self.min_radius_m), self.max_radius_m))
+        todo = np.arange(n_obs)
+        while len(todo):
+            # Midpoint distance <= search radius + segment half length is a safe broad phase.
+            nearby = tree.query_ball_point(gps[todo], radius[todo] + half_lengths.max())
+            counts = np.fromiter((len(x) for x in nearby), dtype=np.int64, count=len(todo))
+            pt = np.repeat(todo, counts)
+            arc = (np.fromiter((j for x in nearby for j in x), dtype=np.int64, count=int(counts.sum()))
+                   if counts.sum() else np.array([], dtype=np.int64))
+            d = self._pair_distance(gps[pt], a[arc], b[arc])
+            keep = d <= radius[pt]
+            pt, arc, d = pt[keep], arc[keep], d[keep]
+            order = np.lexsort((arc, d, pt))
+            pt, arc, d = pt[order], arc[order], d[order]
+            first = np.searchsorted(pt, pt, side="left")
+            top = (np.arange(len(pt)) - first) < self.max_k
+            chosen_pt.append(pt[top]); chosen_arc.append(arc[top]); chosen_d.append(d[top])
+            found = np.zeros(n_obs, dtype=bool)
+            found[pt] = True
+            todo = todo[~found[todo]]
+            if not self.expand_radius:
+                break
+            todo = todo[radius[todo] < self.max_radius_m]
+            radius[todo] = np.minimum(self.max_radius_m, radius[todo] * 2)
+        pt = np.concatenate(chosen_pt) if chosen_pt else np.array([], dtype=np.int64)
+        arc = np.concatenate(chosen_arc) if chosen_arc else np.array([], dtype=np.int64)
+        d = np.concatenate(chosen_d) if chosen_d else np.array([])
+        fallback = np.zeros(len(pt), dtype=bool)
+        empty = np.setdiff1d(np.arange(n_obs), pt)
+        if len(empty):
+            # Keep an explicit nearest-road fallback; the summary records its use.
+            _, nearest = tree.query(gps[empty], k=1)
+            nearest = np.asarray(nearest, dtype=np.int64)
+            pt = np.r_[pt, empty]
+            arc = np.r_[arc, nearest]
+            d = np.r_[d, self._pair_distance(gps[empty], a[nearest], b[nearest])]
+            fallback = np.r_[fallback, np.ones(len(empty), dtype=bool)]
+        order = np.lexsort((arc, d, pt))
+        pt, arc, d, fallback = pt[order], arc[order], d[order], fallback[order]
+        rank = np.arange(len(pt)) - np.searchsorted(pt, pt, side="left") + 1
+
+        obs = obs_ids[pt]
+        truth = pd.array([gt.get(int(o), pd.NA) for o in obs_ids], dtype="Int64")[pt]
+        has_truth = ~pd.isna(truth)
+        label = np.where(has_truth, arc == truth.fillna(-1).to_numpy(np.int64), -1).astype(int)
+        records = {
+            "trip_id": np.full(len(pt), str(trip_id), dtype=object), "obs_idx": obs,
+            "timestamp": track_df["timestamp"].to_numpy(float)[pt],
+            "gps_lon": track_lon[pt], "gps_lat": track_lat[pt],
+            "candidate_arc_id": arc, "from_node_id": endpoints[arc, 0], "to_node_id": endpoints[arc, 1],
+            "dist_to_arc_m": d, "is_target": label,
+        }
+        if include_section12_fields:
+            is_ref = pd.array(np.where(has_truth, label == 1, False), dtype="boolean")
+            is_ref[~has_truth] = pd.NA
+            records.update({"candidate_rank": rank, "reference_arc_id": truth, "is_reference": is_ref,
+                            "distance_m": d, "label": label, "fallback_used": fallback})
         result = pd.DataFrame(records, columns=cols)
         # Shared contract validators allow feature columns only; validate its base projection.
         validate_candidate_df(result[["trip_id", "obs_idx", "timestamp", "gps_lon", "gps_lat",
