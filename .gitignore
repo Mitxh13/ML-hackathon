@@ -28,6 +28,10 @@ Thumbs.db
 *.swp
 *.swo
 
+# Devyard notes
+.devyard/
+devyard/
+
 # Datasets (tracked via .gitkeep)
 data/train/*
 data/student_test/*
