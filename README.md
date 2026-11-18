@@ -140,7 +140,20 @@ Find your local IP address (`ipconfig` on Windows or `ifconfig` on Linux/macOS),
 .venv/bin/python -m uvicorn src.lane_d_app.api_server:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Laptop 2 (Evaluator UI)
+### Laptop 2 (Evaluator UI) - web UI (used for the demo)
+Static web page in `src/lane_d_app/web_ui/` (no Python packages needed on Laptop 2):
+```bash
+python -m http.server 5500 --directory src/lane_d_app/web_ui
+```
+Open `http://localhost:5500/?api=http://<laptop-1-ip>:8000`. The address can also be changed from the
+connection button in the top-right corner. Trips are listed per partition (Evaluator / Student test).
+Run a single trip, or **Run all trips**, then **Export CSV** for report tables. Needs internet access for
+the map tiles and Leaflet.
+
+The UI receives GPS points, the predicted route and metric values only. The map returned by the API is
+built without the reference route, so ground truth stays on Laptop 1.
+
+### Laptop 2 (alternative) - Streamlit UI
 Connect to Laptop 1 by entering its IP address in the Streamlit sidebar (e.g. `http://192.168.1.50:8000`):
 ```powershell
 # Windows
