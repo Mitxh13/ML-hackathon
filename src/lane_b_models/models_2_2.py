@@ -100,15 +100,16 @@ def get_section_2_2_models() -> dict[str, Any]:
 
 
 def compute_observation_top1(df: pd.DataFrame, prob_col: str = "pred_prob") -> float:
-    """Compute observation-level Top-1 accuracy by selecting candidate with highest prob."""
-    correct = 0
-    total = 0
-    for _, group in df.groupby(["trip_id", "obs_idx"]):
-        total += 1
-        best_cand = group.loc[group[prob_col].idxmax()]
-        if best_cand["is_target"] == 1:
-            correct += 1
-    return float(correct / max(total, 1))
+    """Compute observation-level Top-1 accuracy by selecting candidate with highest prob (vectorized)."""
+    if df.empty:
+        return 0.0
+    group_cols = [c for c in ["trip_id", "obs_idx"] if c in df.columns]
+    if not group_cols:
+        group_cols = ["obs_idx"] if "obs_idx" in df.columns else []
+    if not group_cols:
+        return 0.0
+    idx_max = df.groupby(group_cols)[prob_col].idxmax()
+    return float(df.loc[idx_max, "is_target"].mean())
 
 
 class Section22Trainer:
