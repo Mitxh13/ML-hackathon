@@ -1,0 +1,48 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Datasets (tracked via .gitkeep)
+data/train/*
+data/student_test/*
+data/evaluator_test/*
+data/processed/*
+!data/**/.gitkeep
+
+# Artifacts & Output Results (tracked via .gitkeep)
+artifacts/models/*
+artifacts/logs/*
+!artifacts/**/.gitkeep
+results/tables/*
+results/figures/*
+results/maps/*
+!results/**/.gitkeep
+
+# Ignore root zip / raw extraction temp files if any
+*.zip
+*.tar.gz
