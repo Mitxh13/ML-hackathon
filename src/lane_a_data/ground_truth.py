@@ -7,6 +7,21 @@ from pyproj import CRS, Transformer
 from src.contracts.schemas import POINT_GT_COLS, validate_point_gt_df
 
 
+def point_to_segment_distance(
+    p_lon: float, p_lat: float, u_lon: float, u_lat: float, v_lon: float, v_lat: float,
+) -> float:
+    """Return exact local-metric distance from a WGS84 point to a segment in metres."""
+    coords_lon = np.asarray([p_lon, u_lon, v_lon], dtype=float)
+    coords_lat = np.asarray([p_lat, u_lat, v_lat], dtype=float)
+    if not (np.isfinite(coords_lon).all() and np.isfinite(coords_lat).all()):
+        raise ValueError("point and segment coordinates must be finite")
+    if (np.abs(coords_lon) > 180).any() or (np.abs(coords_lat) > 90).any():
+        raise ValueError("coordinates must be valid WGS84 longitude/latitude")
+    transformer, _ = local_transformer(coords_lon, coords_lat)
+    x, y = transformer.transform(coords_lon, coords_lat)
+    return float(_point_segment_distances(np.asarray([[x[0], y[0]]]), np.asarray([[[x[1], y[1]], [x[2], y[2]]]]))[0, 0])
+
+
 def local_transformer(lons: np.ndarray, lats: np.ndarray) -> tuple[Transformer, str]:
     """Choose a trip-local WGS84 / UTM CRS and return its forward transformer."""
     finite = np.isfinite(lons) & np.isfinite(lats) & (np.abs(lons) <= 180) & (np.abs(lats) <= 90)

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from src.contracts.schemas import validate_candidate_df
+from src.contracts.schemas import CANDIDATE_BASE_COLS, validate_candidate_df
 from src.lane_a_data.ground_truth import local_transformer
 
 
@@ -29,10 +29,16 @@ class CandidateGenerator:
         return np.linalg.norm(points[:, None, :] - closest, axis=2)
 
     def generate_candidates(self, trip_id: str, track_df: pd.DataFrame, nodes_df: pd.DataFrame,
-                            arcs_df: pd.DataFrame, point_gt_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        cols = ["trip_id", "obs_idx", "timestamp", "gps_lon", "gps_lat", "candidate_arc_id",
-                "from_node_id", "to_node_id", "dist_to_arc_m", "is_target", "candidate_rank",
-                "reference_arc_id", "is_reference", "distance_m", "label", "fallback_used"]
+                            arcs_df: pd.DataFrame, point_gt_df: pd.DataFrame | None = None,
+                            include_section12_fields: bool = False) -> pd.DataFrame:
+        """Generate candidates using the legacy base schema by default.
+
+        ``include_section12_fields=True`` adds rank, reference aliases and fallback
+        diagnostics for the Section 1.2 batch outputs. The default remains compatible
+        with the existing feature-extraction and model-scoring callers.
+        """
+        extra_cols = ["candidate_rank", "reference_arc_id", "is_reference", "distance_m", "label", "fallback_used"]
+        cols = CANDIDATE_BASE_COLS + (extra_cols if include_section12_fields else [])
         if arcs_df.empty or nodes_df.empty:
             raise ValueError("Cannot generate candidates from an empty road network")
         track_lon, track_lat = track_df.gps_lon.to_numpy(float), track_df.gps_lat.to_numpy(float)
@@ -85,13 +91,16 @@ class CandidateGenerator:
                 fallback = True
             for rank, (arc_id, distance) in enumerate(zip(chosen_ids, distances), start=1):
                 label = int(arc_id == int(truth)) if not pd.isna(truth) else -1
-                records.append({"trip_id": str(trip_id), "obs_idx": obs_idx,
+                record = {"trip_id": str(trip_id), "obs_idx": obs_idx,
                     "timestamp": float(obs.timestamp), "gps_lon": float(obs.gps_lon), "gps_lat": float(obs.gps_lat),
                     "candidate_arc_id": int(arc_id), "from_node_id": int(endpoints[arc_id, 0]),
                     "to_node_id": int(endpoints[arc_id, 1]), "dist_to_arc_m": float(distance),
-                    "is_target": label, "candidate_rank": rank, "reference_arc_id": truth,
+                    "is_target": label}
+                if include_section12_fields:
+                    record.update({"candidate_rank": rank, "reference_arc_id": truth,
                     "is_reference": (bool(label == 1) if label >= 0 else pd.NA), "distance_m": float(distance),
                     "label": label, "fallback_used": fallback})
+                records.append(record)
         result = pd.DataFrame(records, columns=cols)
         # Shared contract validators allow feature columns only; validate its base projection.
         validate_candidate_df(result[["trip_id", "obs_idx", "timestamp", "gps_lon", "gps_lat",

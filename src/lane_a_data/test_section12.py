@@ -2,8 +2,8 @@
 import numpy as np
 import pandas as pd
 import pytest
-from src.contracts.schemas import POINT_GT_COLS, validate_point_gt_df
-from src.lane_a_data.ground_truth import assign_point_ground_truth, local_transformer
+from src.contracts.schemas import CANDIDATE_BASE_COLS, POINT_GT_COLS, validate_candidate_df, validate_point_gt_df
+from src.lane_a_data.ground_truth import assign_point_ground_truth, local_transformer, point_to_segment_distance
 from src.lane_a_data.candidates import CandidateGenerator
 from src.lane_a_data.pipeline import run_partition
 from src.lane_a_data.validation import candidate_metrics
@@ -24,6 +24,10 @@ def test_projection_uses_lon_lat_and_metric_units():
     assert abs(y[1] - y[0]) < 1
 
 
+def test_legacy_point_to_segment_distance_helper_is_preserved_and_exact():
+    assert 10 < point_to_segment_distance(.005, .0001, 0., 0., .01, 0.) < 12
+
+
 def test_monotone_route_order_and_repeated_arc_occurrences():
     nodes, arcs = network()
     # Arc 0 repeats after the connected loop 0 -> 1 -> 3.
@@ -42,13 +46,23 @@ def test_multiple_observations_and_candidate_distance_labels():
     track = pd.DataFrame({"gps_lon": [.0003, .0004], "gps_lat": [.00001, .00001],
                           "timestamp": [0., 2.], "obs_idx": [7, 8]})
     gt = pd.DataFrame({"trip_id": ["t", "t"], "obs_idx": [7, 8], "reference_arc_id": [0, 0]})
-    candidates = CandidateGenerator(max_dist_m=60, max_k=3, max_radius_m=100).generate_candidates("t", track, nodes, arcs, gt)
+    candidates = CandidateGenerator(max_dist_m=60, max_k=3, max_radius_m=100).generate_candidates("t", track, nodes, arcs, gt, include_section12_fields=True)
     obs7 = candidates[candidates.obs_idx == 7]
     assert obs7.dist_to_arc_m.is_monotonic_increasing
     assert obs7.iloc[0].candidate_arc_id == 0
     assert obs7.loc[obs7.candidate_arc_id == 0, "label"].eq(1).all()
     assert obs7.loc[obs7.candidate_arc_id != 0, "label"].eq(0).all()
     assert candidates.groupby("obs_idx").size().loc[8] >= 1
+
+
+def test_existing_candidate_consumer_receives_legacy_contract_by_default():
+    nodes, arcs = network()
+    track = pd.DataFrame({"gps_lon": [.0003], "gps_lat": [.00001], "timestamp": [0.], "obs_idx": [3]})
+    gt = pd.DataFrame({"trip_id": ["t"], "obs_idx": [3], "true_arc_id": [0]})
+    result = CandidateGenerator(max_dist_m=60).generate_candidates("t", track, nodes, arcs, gt)
+    assert result.columns.tolist() == CANDIDATE_BASE_COLS
+    assert validate_candidate_df(result)
+    assert result.is_target.eq(1).any()
 
 
 def test_missing_reference_is_candidate_miss_and_empty_sets_counted():
@@ -136,12 +150,12 @@ def test_radius_expansion_fallback_and_candidate_miss_are_flagged():
     nodes, arcs = network()
     track = pd.DataFrame({"gps_lon": [.001], "gps_lat": [.0005], "timestamp": [0.], "obs_idx": [2]})
     gt = pd.DataFrame({"obs_idx": [2], "true_arc_id": [99]})
-    expanded = CandidateGenerator(max_dist_m=10, min_radius_m=10, max_radius_m=100, max_k=2).generate_candidates("t", track, nodes, arcs, gt)
+    expanded = CandidateGenerator(max_dist_m=10, min_radius_m=10, max_radius_m=100, max_k=2).generate_candidates("t", track, nodes, arcs, gt, include_section12_fields=True)
     assert not expanded.fallback_used.any()
     assert expanded.dist_to_arc_m.max() <= 100
     assert expanded.label.eq(0).all()
     far = track.assign(gps_lon=.5)
-    fallback = CandidateGenerator(max_dist_m=10, min_radius_m=10, max_radius_m=20).generate_candidates("t", far, nodes, arcs, gt)
+    fallback = CandidateGenerator(max_dist_m=10, min_radius_m=10, max_radius_m=20).generate_candidates("t", far, nodes, arcs, gt, include_section12_fields=True)
     assert fallback.fallback_used.all()
 
 
