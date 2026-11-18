@@ -6,25 +6,7 @@ import numpy as np
 import pandas as pd
 
 from src.contracts.schemas import POINT_GT_COLS, validate_point_gt_df
-from src.lane_c_hmm.road_graph import haversine_distance_m
-
-
-def point_to_segment_distance(
-    p_lon: float,
-    p_lat: float,
-    u_lon: float,
-    u_lat: float,
-    v_lon: float,
-    v_lat: float,
-) -> float:
-    """Approximate perpendicular/geodesic distance from a point to a road segment (u, v)."""
-    # Midpoint distance approximation or direct projection
-    mid_lon = (u_lon + v_lon) / 2.0
-    mid_lat = (u_lat + v_lat) / 2.0
-    d_u = haversine_distance_m(p_lon, p_lat, u_lon, u_lat)
-    d_v = haversine_distance_m(p_lon, p_lat, v_lon, v_lat)
-    d_mid = haversine_distance_m(p_lon, p_lat, mid_lon, mid_lat)
-    return float(min(d_u, d_v, d_mid))
+from src.lane_a_data.preprocessing import haversine_distance_m, project_coordinates
 
 
 def assign_point_ground_truth(
@@ -57,27 +39,42 @@ def assign_point_ground_truth(
     t_len = len(track_df)
     r_len = len(route_arcs)
 
-    # Pre-extract coordinates of route segments
-    route_coords = []
-    for arc_id in route_arcs:
-        u = int(arcs_df.iloc[arc_id, 0])
-        v = int(arcs_df.iloc[arc_id, 1])
-        u_lon, u_lat = float(nodes_df.iloc[u, 0]), float(nodes_df.iloc[u, 1])
-        v_lon, v_lat = float(nodes_df.iloc[v, 0]), float(nodes_df.iloc[v, 1])
-        route_coords.append((u_lon, u_lat, v_lon, v_lat))
+    # Project coordinates to metric CRS for fast vectorized orthogonal projection
+    proj_track = (
+        track_df
+        if "x_m" in track_df.columns
+        else project_coordinates(track_df, lon_col="gps_lon", lat_col="gps_lat")
+    )
+    proj_nodes = (
+        nodes_df
+        if "x_m" in nodes_df.columns
+        else project_coordinates(nodes_df, lon_col="lon", lat_col="lat")
+    )
 
-    # Dynamic programming / monotonic alignment
-    cost_matrix = np.full((t_len, r_len), np.inf)
+    u_indices = arcs_df.iloc[route_arcs, 0].values.astype(int)
+    v_indices = arcs_df.iloc[route_arcs, 1].values.astype(int)
 
-    # Compute metric distance from each GPS point to each route segment
-    for t in range(t_len):
-        p_lon = float(track_df.iloc[t]["gps_lon"])
-        p_lat = float(track_df.iloc[t]["gps_lat"])
-        for r in range(r_len):
-            u_lon, u_lat, v_lon, v_lat = route_coords[r]
-            cost_matrix[t, r] = point_to_segment_distance(p_lon, p_lat, u_lon, u_lat, v_lon, v_lat)
+    ax = proj_nodes["x_m"].values[u_indices][None, :]  # Shape: (1, M)
+    ay = proj_nodes["y_m"].values[u_indices][None, :]
+    bx = proj_nodes["x_m"].values[v_indices][None, :]
+    by = proj_nodes["y_m"].values[v_indices][None, :]
 
-    # Monotonic alignment with DP
+    px = proj_track["x_m"].values[:, None]  # Shape: (T, 1)
+    py = proj_track["y_m"].values[:, None]
+
+    dx = bx - ax
+    dy = by - ay
+    l2 = np.maximum(dx * dx + dy * dy, 1e-6)
+
+    # Vectorized orthogonal projection fraction alpha in [0, 1]
+    alpha = np.clip(((px - ax) * dx + (py - ay) * dy) / l2, 0.0, 1.0)
+    qx = ax + alpha * dx
+    qy = ay + alpha * dy
+
+    # Exact orthogonal distance in meters
+    cost_matrix = np.sqrt((px - qx) ** 2 + (py - qy) ** 2)
+
+    # Monotonic alignment via dynamic programming
     dp = np.full((t_len, r_len), np.inf)
     parent = np.zeros((t_len, r_len), dtype=int)
 
@@ -88,14 +85,13 @@ def assign_point_ground_truth(
         min_prev = np.inf
         best_r = 0
         for r in range(r_len):
-            # Monotonic: can come from any prev_r <= r
             if dp[t - 1, r] < min_prev:
                 min_prev = dp[t - 1, r]
                 best_r = r
             dp[t, r] = min_prev + cost_matrix[t, r]
             parent[t, r] = best_r
 
-    # Backtrack
+    # Backtrack optimal sequence
     best_last_r = int(np.argmin(dp[-1, :]))
     assigned_r = [best_last_r]
 

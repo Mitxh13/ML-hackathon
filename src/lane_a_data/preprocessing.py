@@ -108,6 +108,30 @@ def lonlat_to_xy(lon, lat, crs_to: str) -> tuple[np.ndarray, np.ndarray]:
     return _utm_forward_numpy(lon, lat, crs_to)
 
 
+def haversine_distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Calculate Haversine geodesic distance in meters between two lon/lat coordinates."""
+    r = 6371000.0  # Earth radius in meters
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlam = np.radians(lon2 - lon1)
+
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
+    return float(2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a)))
+
+
+def haversine_distance_np(
+    lon1: np.ndarray, lat1: np.ndarray, lon2: np.ndarray, lat2: np.ndarray
+) -> np.ndarray:
+    """Vectorized Haversine geodesic distance in meters."""
+    r = 6371000.0
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlam = np.radians(lon2 - lon1)
+
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
+    return 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+
 def project_coordinates(
     df: pd.DataFrame,
     lon_col: str = "gps_lon",
