@@ -1,268 +1,225 @@
-"""Shared evaluation metrics for PathSnap.
+"""Shared evaluation metrics for PathSnap (Section 3.1).
 
-Every table in Report Section 3 (Model Comparison), Section 4 (Bayesian Tuning),
-and Section 5 (HMM Reconstruction) must compute metrics through this module.
+Every table in Report Section 3 (Model Comparison), Section 4 (Bayesian Tuning) and
+Section 5 (HMM Reconstruction) must compute its numbers through this module.
 
-Standardized Metrics:
-1. Top-1 Accuracy: Fraction of GPS observations where predicted arc_id == true_arc_id.
-2. Macro F1-Score:
-   - Candidate-level binary Macro F1: mean F1 of class 0 and class 1.
-   - Observation-level multi-class Macro F1: macro-averaged F1 over active arc_id classes.
-3. Route Continuity: Percentage of consecutive prediction pairs (a_{t-1}, a_t) that are
-   either identical, directly connected in .arcs, or topologically connected via short path.
-4. Candidate Miss Rate: Fraction of GPS observations where true_arc_id is absent from candidates.
-5. Safe Log Loss: Binary cross-entropy on candidate probabilities (clipped to [eps, 1-eps]).
-6. Inference Time: Wall-clock execution time in seconds.
+Definitions
+-----------
+1. Observation-level Top-1 accuracy: share of *labelled* GPS observations whose predicted
+   arc equals the reference arc. Observations without a reference label (the alignment left
+   them unlabeled because the reference route is > 100 m away) are excluded.
+2. Macro F1:
+   - candidate level (binary): unweighted mean of the F1 of class 0 and class 1 over
+     (observation, candidate) rows -> ``compute_macro_f1(is_target, pred_label)``;
+   - observation level (multi-class): macro F1 over the arc ids of one trip
+     -> ``compute_macro_f1(true_arc_id, predicted_arc_id)``. Arc ids are local to a trip,
+     so over a partition this is averaged trip by trip, never pooled.
+3. Route continuity (percent): share of consecutive prediction pairs (a[t-1], a[t]) that are
+   the same arc, directly connected (to_node(a[t-1]) == from_node(a[t])), or connected by a
+   road path no longer than ``max_speed_mps * dt + slack_m`` (only checked when a road
+   graph is supplied).
+4. Candidate miss rate: share of labelled observations whose reference arc is not in the
+   candidate set.
+5. Safe log loss: binary cross-entropy of ``pred_prob`` against ``is_target`` with
+   probabilities clipped to [eps, 1 - eps]; ``None`` when no probabilities exist.
+6. Route-level (sequence) precision / recall / F1: overlap between the set of arcs the
+   predicted route uses and the set of reference arcs.
+7. Inference time: wall-clock seconds.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, log_loss
 
+DEFAULT_MAX_SPEED_MPS = 50.0
+DEFAULT_CONTINUITY_SLACK_M = 50.0
 
-def compute_top1_accuracy(
-    y_true_arc: Sequence[int] | np.ndarray | pd.Series,
-    y_pred_arc: Sequence[int] | np.ndarray | pd.Series,
-) -> float:
-    """Calculate observation-level Top-1 accuracy.
 
-    Args:
-        y_true_arc: Sequence of true road segment IDs per observation.
-        y_pred_arc: Sequence of predicted road segment IDs per observation.
+def _labelled(y_true, y_pred) -> tuple[np.ndarray, np.ndarray]:
+    """Drop positions whose reference label is missing; return int64 arrays."""
+    p = np.asarray(y_pred)
+    raw = y_true.to_numpy() if isinstance(y_true, pd.Series) and y_true.dtype.kind in "iub" else y_true
+    if isinstance(raw, np.ndarray) and raw.dtype.kind in "iub":  # fast path: plain integer labels
+        if len(raw) != len(p):
+            raise ValueError(f"Length mismatch: y_true has {len(raw)} items, y_pred has {len(p)}.")
+        return raw.astype(np.int64), p.astype(np.int64)
+    t = pd.array(y_true, dtype="Int64") if isinstance(y_true, (pd.Series, pd.api.extensions.ExtensionArray)) \
+        else pd.array(np.asarray(y_true, dtype=object), dtype="Int64")
+    if len(t) != len(p):
+        raise ValueError(f"Length mismatch: y_true has {len(t)} items, y_pred has {len(p)}.")
+    mask = ~np.asarray(pd.isna(t), dtype=bool)
+    return np.asarray(t[mask], dtype=np.int64), p[mask].astype(np.int64)
 
-    Returns:
-        Fraction of correctly predicted observations in [0.0, 1.0].
-    """
-    y_true = np.asarray(y_true_arc)
-    y_pred = np.asarray(y_pred_arc)
 
-    if len(y_true) == 0:
+def compute_top1_accuracy(y_true_arc, y_pred_arc) -> float:
+    """Share of labelled observations whose predicted arc equals the reference arc."""
+    t, p = _labelled(y_true_arc, y_pred_arc)
+    if len(t) == 0:
         return 0.0
-    if len(y_true) != len(y_pred):
-        raise ValueError(
-            f"Length mismatch: y_true has {len(y_true)} items, y_pred has {len(y_pred)}."
-        )
-
-    return float(np.mean(y_true == y_pred))
+    return float(np.mean(t == p))
 
 
-def compute_macro_f1(
-    y_true: Sequence[int] | np.ndarray | pd.Series,
-    y_pred: Sequence[int] | np.ndarray | pd.Series,
-    zero_division: float = 0.0,
-) -> float:
-    """Calculate macro-averaged F1 score.
+def compute_macro_f1(y_true, y_pred, zero_division: float = 0.0) -> float:
+    """Macro-averaged F1 (binary candidate labels or multi-class arc ids of one trip).
 
-    Works for both candidate-level binary targets and observation-level
-    multi-class arc predictions.
-
-    Args:
-        y_true: Ground truth labels (binary 0/1 or multi-class arc IDs).
-        y_pred: Predicted labels.
-        zero_division: Value to return when there is a zero division.
-
-    Returns:
-        Macro F1 score in [0.0, 1.0].
+    Positions with a missing reference label are ignored.
     """
-    y_t = np.asarray(y_true)
-    y_p = np.asarray(y_pred)
-
-    if len(y_t) == 0:
+    t, p = _labelled(y_true, y_pred)
+    if len(t) == 0:
         return 0.0
+    return float(f1_score(t, p, average="macro", zero_division=zero_division))
 
-    return float(f1_score(y_t, y_p, average="macro", zero_division=zero_division))
+
+def _arc_endpoints(arcs_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    if "from_node_id" in arcs_df.columns and "to_node_id" in arcs_df.columns:
+        return arcs_df["from_node_id"].to_numpy(np.int64), arcs_df["to_node_id"].to_numpy(np.int64)
+    if arcs_df.shape[1] >= 2:
+        return arcs_df.iloc[:, 0].to_numpy(np.int64), arcs_df.iloc[:, 1].to_numpy(np.int64)
+    raise ValueError("arcs_df must have from_node_id and to_node_id columns.")
+
+
+def continuity_flags(
+    pred_arcs: Sequence[int],
+    arcs_df: pd.DataFrame,
+    graph: Any = None,
+    timestamps: Optional[Sequence[float]] = None,
+    max_speed_mps: float = DEFAULT_MAX_SPEED_MPS,
+    slack_m: float = DEFAULT_CONTINUITY_SLACK_M,
+) -> np.ndarray:
+    """Boolean array (length T-1): is the transition a[t-1] -> a[t] physically continuous?"""
+    arcs = np.asarray(pred_arcs, dtype=np.int64)
+    if len(arcs) <= 1:
+        return np.zeros(0, dtype=bool)
+    frm, to = _arc_endpoints(arcs_df)
+    prev, curr = arcs[:-1], arcs[1:]
+    ok = (prev == curr) | (to[prev] == frm[curr])
+    if graph is not None and hasattr(graph, "shortest_path_distance"):
+        dt = np.ones(len(prev)) if timestamps is None else np.maximum(np.diff(np.asarray(timestamps, float)), 1.0)
+        for i in np.flatnonzero(~ok):
+            limit = max_speed_mps * dt[i] + slack_m
+            d = graph.shortest_path_distance(int(to[prev[i]]), int(frm[curr[i]]), limit_m=limit)
+            ok[i] = bool(np.isfinite(d))
+    return ok
 
 
 def compute_route_continuity(
-    pred_arcs: Sequence[int] | np.ndarray | pd.Series,
+    pred_arcs,
     arcs_df: pd.DataFrame,
     graph: Any = None,
+    timestamps: Optional[Sequence[float]] = None,
+    max_speed_mps: float = DEFAULT_MAX_SPEED_MPS,
+    slack_m: float = DEFAULT_CONTINUITY_SLACK_M,
 ) -> float:
-    """Calculate route continuity percentage for consecutive observation predictions.
-
-    A transition between a_{t-1} and a_t is considered continuous if:
-    1. a_{t-1} == a_t (vehicle stayed on same segment)
-    2. to_node(a_{t-1}) == from_node(a_t) (directly connected in .arcs)
-    3. If graph is provided, reachable via a short graph path (e.g. <= 2 edges).
-
-    Args:
-        pred_arcs: Chronological sequence of predicted arc_id values for t = 0 ... T-1.
-        arcs_df: DataFrame of road arcs with columns ['from_node_id', 'to_node_id']
-            where the 0-based row index corresponds to arc_id.
-        graph: Optional NetworkX directed graph or RoadNetworkGraph instance.
-
-    Returns:
-        Route continuity percentage in [0.0, 100.0].
-    """
-    arcs = list(pred_arcs)
-    if len(arcs) <= 1:
+    """Route continuity in percent [0, 100] (see module docstring, definition 3)."""
+    flags = continuity_flags(pred_arcs, arcs_df, graph, timestamps, max_speed_mps, slack_m)
+    if len(flags) == 0:
         return 100.0
-
-    # Ensure arcs_df has columns or index
-    if "from_node_id" not in arcs_df.columns or "to_node_id" not in arcs_df.columns:
-        # Check if 2 unnamed columns exist
-        if len(arcs_df.columns) >= 2:
-            from_nodes = arcs_df.iloc[:, 0].to_dict()
-            to_nodes = arcs_df.iloc[:, 1].to_dict()
-        else:
-            raise ValueError("arcs_df must have from_node_id and to_node_id columns.")
-    else:
-        from_nodes = arcs_df["from_node_id"].to_dict()
-        to_nodes = arcs_df["to_node_id"].to_dict()
-
-    continuous_count = 0
-    total_transitions = len(arcs) - 1
-
-    for i in range(total_transitions):
-        a_prev = arcs[i]
-        a_curr = arcs[i + 1]
-
-        # Case 1: Same arc
-        if a_prev == a_curr:
-            continuous_count += 1
-            continue
-
-        # Case 2: Direct connection
-        prev_to = to_nodes.get(a_prev)
-        curr_from = from_nodes.get(a_curr)
-        if prev_to is not None and curr_from is not None and prev_to == curr_from:
-            continuous_count += 1
-            continue
-
-        # Case 3: Graph shortest path check if graph is supplied
-        if graph is not None:
-            is_connected = False
-            try:
-                if hasattr(graph, "has_path"):
-                    is_connected = graph.has_path(prev_to, curr_from, max_hops=2)
-                elif hasattr(graph, "nx_graph"):
-                    import networkx as nx
-                    if nx.has_path(graph.nx_graph, prev_to, curr_from):
-                        path_len = nx.shortest_path_length(graph.nx_graph, prev_to, curr_from)
-                        if path_len <= 2:
-                            is_connected = True
-            except Exception:
-                is_connected = False
-
-            if is_connected:
-                continuous_count += 1
-
-    return float((continuous_count / total_transitions) * 100.0)
+    return float(flags.mean() * 100.0)
 
 
-def compute_candidate_miss_rate(candidates_df: pd.DataFrame) -> float:
-    """Calculate the candidate miss rate across observations.
+def compute_candidate_miss_rate(candidates_df: pd.DataFrame) -> Optional[float]:
+    """Share of labelled observations whose reference arc is absent from the candidates.
 
-    Candidate Miss Rate is the fraction of GPS observations where the true road
-    segment is not included in the candidate set.
-
-    Args:
-        candidates_df: Candidate DataFrame with columns ['obs_idx', 'is_target'].
-
-    Returns:
-        Miss rate in [0.0, 1.0].
+    Observations whose candidates are all unlabeled (``is_target == -1``) are excluded.
+    Returns ``None`` when there is no labelled observation.
     """
-    if candidates_df is None or candidates_df.empty:
-        return 0.0
-
-    if "obs_idx" not in candidates_df.columns or "is_target" not in candidates_df.columns:
-        return 0.0
-
-    obs_grouped = candidates_df.groupby("obs_idx")["is_target"].max()
-    if len(obs_grouped) == 0:
-        return 0.0
-
-    # is_target max == 1 means candidate hit; max <= 0 means candidate miss
-    misses = (obs_grouped <= 0).sum()
-    return float(misses / len(obs_grouped))
-
-
-def compute_log_loss_safe(
-    y_true_bin: Sequence[int] | np.ndarray | pd.Series,
-    pred_prob: Sequence[float] | np.ndarray | pd.Series,
-    eps: float = 1e-15,
-) -> Optional[float]:
-    """Calculate binary cross-entropy log loss safely with probability clipping.
-
-    Returns None for non-probabilistic or single-class edge cases.
-
-    Args:
-        y_true_bin: Binary ground truth (0 or 1).
-        pred_prob: Predicted probabilities P(is_target = 1) in [0.0, 1.0].
-        eps: Epsilon clipping boundary.
-
-    Returns:
-        Log loss as float, or None if computation is invalid.
-    """
-    y_t = np.asarray(y_true_bin)
-    p_p = np.asarray(pred_prob)
-
-    if len(y_t) == 0 or len(p_p) == 0:
+    if candidates_df is None or candidates_df.empty or "is_target" not in candidates_df.columns:
         return None
-    if len(y_t) != len(p_p):
+    keys = [k for k in ("trip_id", "obs_idx") if k in candidates_df.columns]
+    best = candidates_df.groupby(keys)["is_target"].max()
+    best = best[best >= 0]
+    if len(best) == 0:
+        return None
+    return float((best == 0).mean())
+
+
+def compute_log_loss_safe(y_true_bin, pred_prob, eps: float = 1e-15) -> Optional[float]:
+    """Binary cross-entropy with clipped probabilities; ``None`` if it cannot be computed."""
+    y = np.asarray(y_true_bin)
+    p = np.asarray(pred_prob, dtype=float)
+    if len(y) == 0 or len(p) == 0:
+        return None
+    if len(y) != len(p):
         raise ValueError("Length mismatch between ground truth and predicted probabilities.")
+    p = np.clip(p, eps, 1.0 - eps)
+    classes = np.unique(y)
+    if len(classes) < 2:
+        return float(-np.mean(np.log(p))) if classes[0] == 1 else float(-np.mean(np.log(1.0 - p)))
+    return float(log_loss(y, p, labels=[0, 1]))
 
-    # Unique classes check
-    unique_classes = np.unique(y_t)
-    if len(unique_classes) < 2 and not (0 in unique_classes and 1 in unique_classes):
-        # Only one class present in slice
-        p_clipped = np.clip(p_p, eps, 1.0 - eps)
-        if unique_classes[0] == 1:
-            return float(-np.mean(np.log(p_clipped)))
-        else:
-            return float(-np.mean(np.log(1.0 - p_clipped)))
 
-    p_clipped = np.clip(p_p, eps, 1.0 - eps)
-    return float(log_loss(y_t, p_clipped, labels=[0, 1]))
+def compute_route_overlap(
+    pred_arcs: Sequence[int],
+    reference_arcs: Sequence[int],
+    arc_length_m: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Sequence-level overlap between the predicted route and the reference route.
+
+    precision = share of predicted arcs that are reference arcs, recall = share of reference
+    arcs that were predicted. With ``arc_length_m`` both are weighted by arc length.
+    """
+    pred = np.unique(np.asarray(pred_arcs, dtype=np.int64))
+    ref = np.unique(np.asarray(reference_arcs, dtype=np.int64))
+    if len(pred) == 0 or len(ref) == 0:
+        return {"route_precision": 0.0, "route_recall": 0.0, "route_f1": 0.0}
+    hit_p = np.isin(pred, ref)
+    hit_r = np.isin(ref, pred)
+    if arc_length_m is not None:
+        wp, wr = np.maximum(arc_length_m[pred], 1e-6), np.maximum(arc_length_m[ref], 1e-6)
+        precision = float((wp * hit_p).sum() / wp.sum())
+        recall = float((wr * hit_r).sum() / wr.sum())
+    else:
+        precision, recall = float(hit_p.mean()), float(hit_r.mean())
+    f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+    return {"route_precision": precision, "route_recall": recall, "route_f1": float(f1)}
 
 
 def evaluate_predictions(
     point_gt_df: pd.DataFrame,
-    pred_arcs: Sequence[int] | np.ndarray | pd.Series,
+    pred_arcs,
     arcs_df: pd.DataFrame,
     candidates_df: Optional[pd.DataFrame] = None,
     inference_time_sec: float = 0.0,
     graph: Any = None,
-) -> dict[str, Optional[float]]:
-    """Compute the standardized PathSnap evaluation metrics dictionary.
+    timestamps: Optional[Sequence[float]] = None,
+) -> Dict[str, Optional[float]]:
+    """Standard PathSnap metrics for one trip (Contract 5 keys plus route-level extras).
 
-    Args:
-        point_gt_df: Point-level ground truth DataFrame with 'true_arc_id'.
-        pred_arcs: Sequence of predicted arc IDs for each point.
-        arcs_df: Road arcs DataFrame with from/to nodes.
-        candidates_df: Optional candidate DataFrame for candidate miss rate and log loss.
-        inference_time_sec: Wall-clock execution time in seconds.
-        graph: Optional road network graph.
-
-    Returns:
-        Dictionary of metrics conforming to Contract 5.
+    ``pred_arcs`` must be aligned row by row with ``point_gt_df``.
+    Keys: top1_accuracy, macro_f1 (observation level), route_continuity (percent),
+    log_loss, candidate_miss_rate, inference_time_sec, candidate_macro_f1 (binary, if
+    ``pred_label`` is available), route_precision / route_recall / route_f1 (reference arcs
+    = arcs of the labelled observations), label_coverage, n_points.
     """
-    y_true_arc = point_gt_df["true_arc_id"].values
-    top1 = compute_top1_accuracy(y_true_arc, pred_arcs)
-    macro_f1 = compute_macro_f1(y_true_arc, pred_arcs)
-    continuity = compute_route_continuity(pred_arcs, arcs_df, graph=graph)
+    y_true = point_gt_df["true_arc_id"]
+    pred = np.asarray(pred_arcs, dtype=np.int64)
+    if timestamps is None and "timestamp" in point_gt_df.columns:
+        timestamps = point_gt_df["timestamp"].to_numpy(float)
 
-    miss_rate: Optional[float] = None
-    logloss_val: Optional[float] = None
-
-    if candidates_df is not None and not candidates_df.empty:
-        miss_rate = compute_candidate_miss_rate(candidates_df)
-        if "pred_prob" in candidates_df.columns and "is_target" in candidates_df.columns:
-            valid_mask = candidates_df["is_target"].isin([0, 1])
-            if valid_mask.any():
-                logloss_val = compute_log_loss_safe(
-                    candidates_df.loc[valid_mask, "is_target"],
-                    candidates_df.loc[valid_mask, "pred_prob"],
-                )
-
-    return {
-        "macro_f1": macro_f1,
-        "top1_accuracy": top1,
-        "route_continuity": continuity,
-        "log_loss": logloss_val,
-        "candidate_miss_rate": miss_rate,
+    labelled = ~pd.isna(pd.array(y_true, dtype="Int64"))
+    metrics: Dict[str, Optional[float]] = {
+        "top1_accuracy": compute_top1_accuracy(y_true, pred),
+        "macro_f1": compute_macro_f1(y_true, pred),
+        "route_continuity": compute_route_continuity(pred, arcs_df, graph=graph, timestamps=timestamps),
+        "log_loss": None,
+        "candidate_miss_rate": None,
         "inference_time_sec": float(inference_time_sec),
     }
+    if candidates_df is not None and not candidates_df.empty:
+        metrics["candidate_miss_rate"] = compute_candidate_miss_rate(candidates_df)
+        if "is_target" in candidates_df.columns:
+            rows = candidates_df[candidates_df["is_target"].isin([0, 1])]
+            if "pred_prob" in rows.columns and len(rows):
+                metrics["log_loss"] = compute_log_loss_safe(rows["is_target"], rows["pred_prob"])
+            if "pred_label" in rows.columns and len(rows):
+                metrics["candidate_macro_f1"] = compute_macro_f1(rows["is_target"], rows["pred_label"])
+    ref = np.asarray(pd.array(y_true, dtype="Int64")[labelled], dtype=np.int64)
+    lengths = getattr(graph, "arc_length_m", None)
+    metrics.update(compute_route_overlap(pred[labelled], ref, lengths))
+    metrics["label_coverage"] = float(labelled.mean()) if len(labelled) else 0.0
+    metrics["n_points"] = float(len(pred))
+    return metrics
