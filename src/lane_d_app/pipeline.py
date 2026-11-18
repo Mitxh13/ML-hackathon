@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 import numpy as np
@@ -14,7 +15,7 @@ from src.lane_a_data.ground_truth import assign_point_ground_truth
 from src.lane_a_data.candidates import CandidateGenerator
 from src.lane_a_data.features import extract_candidate_features
 from src.lane_b_models.evaluate_models import predict_candidates
-from src.lane_c_hmm.decoder import ViterbiRouteDecoder
+from src.lane_c_hmm.decoder import MODE_ALIASES, ViterbiRouteDecoder, load_tuned_decoders
 from src.lane_c_hmm.metrics import evaluate_predictions
 from src.lane_c_hmm.road_graph import RoadNetworkGraph
 from src.lane_c_hmm.folium_maps import create_route_map, render_map_html
@@ -34,10 +35,15 @@ class PathSnapPipeline:
         feature_names: Optional[list[str]] = None,
         decoder: Optional[ViterbiRouteDecoder] = None,
         candidate_generator: Optional[CandidateGenerator] = None,
+        hmm_params_path: str = "configs/hmm_params.json",
     ) -> None:
         self.model = model
         self.feature_names = feature_names
-        self.decoder = decoder or ViterbiRouteDecoder()
+        # One decoder per mode with the settings tuned on training trips (configs/hmm_params.json).
+        self.decoders = load_tuned_decoders(hmm_params_path)
+        if decoder is not None:
+            self.decoders = {mode: decoder for mode in self.decoders}
+        self.decoder = self.decoders["ml_hmm"]
         self.candidate_generator = candidate_generator or CandidateGenerator()
 
     def process_trip(
@@ -67,30 +73,17 @@ class PathSnapPipeline:
         arcs_df = trip_data["arcs"]
         has_route = "route" in trip_data
 
-        # Preprocess track
+        # Prediction pipeline (timed). Ground truth is NOT used anywhere in these steps.
+        t_start = time.perf_counter()
         clean_track = preprocess_track(track_df)
 
-        # Ground truth if available (strictly server-side)
-        point_gt_df = None
-        if has_route:
-            try:
-                point_gt_df = assign_point_ground_truth(
-                    trip_id=trip_id,
-                    track_df=clean_track,
-                    route_df=trip_data["route"],
-                    nodes_df=nodes_df,
-                    arcs_df=arcs_df,
-                )
-            except Exception:
-                point_gt_df = None
-
-        # Step 1: Candidate Generation (Lane A)
+        # Step 1: Candidate Generation (Lane A) - no labels passed in
         candidates_df = self.candidate_generator.generate_candidates(
             trip_id=trip_id,
             track_df=clean_track,
             nodes_df=nodes_df,
             arcs_df=arcs_df,
-            point_gt_df=point_gt_df,
+            point_gt_df=None,
         )
 
         # Step 2: Feature Extraction (Lane A)
@@ -102,6 +95,7 @@ class PathSnapPipeline:
         )
 
         # Step 3: Model Scoring (Lane B)
+        decoder_mode = MODE_ALIASES.get(mode, mode)
         if self.model is not None:
             scored_candidates = predict_candidates(
                 model=self.model,
@@ -109,52 +103,75 @@ class PathSnapPipeline:
                 feature_cols=self.feature_names,
             )
         else:
-            # Fallback mock probability based on distance
-            scored_candidates = candidates_df.copy()
-            # Invert distance into pseudo-probability
-            scored_candidates["pred_prob"] = np.exp(-0.5 * (scored_candidates["dist_to_arc_m"] / 15.0) ** 2)
-            scored_candidates["pred_label"] = (scored_candidates["pred_prob"] >= 0.5).astype(int)
+            # No trained model available: decode with the classifier-free distance HMM
+            # instead of inventing probabilities, and report the mode actually used.
+            scored_candidates = candidates_df
+            if decoder_mode in ("ml_hmm", "classifier_only"):
+                decoder_mode = "distance_hmm"
 
         # Step 4: Decoding (Lane C)
         graph = RoadNetworkGraph(nodes_df, arcs_df)
-        decoder_output: DecoderOutput = self.decoder.decode_trip(
+        decoder = self.decoders.get(decoder_mode, self.decoder)
+        decoder_output: DecoderOutput = decoder.decode_trip(
             candidates_df=scored_candidates,
             nodes_df=nodes_df,
             arcs_df=arcs_df,
-            mode=mode,
+            mode=decoder_mode,
             graph=graph,
+            obs_index=clean_track["obs_idx"].to_numpy(),
         )
+        pipeline_seconds = time.perf_counter() - t_start
 
-        # Step 5: Metrics (Lane C)
+        # Step 5: Metrics (Lane C) - reference route used server-side only, after prediction
         metrics = {
             "macro_f1": None,
             "top1_accuracy": None,
             "route_continuity": None,
             "log_loss": None,
             "candidate_miss_rate": None,
-            "inference_time_sec": decoder_output.inference_time_sec,
+            "inference_time_sec": pipeline_seconds,
         }
 
-        if point_gt_df is not None:
-            metrics = evaluate_predictions(
-                point_gt_df=point_gt_df,
-                pred_arcs=decoder_output.point_predictions,
-                arcs_df=arcs_df,
-                candidates_df=scored_candidates,
-                inference_time_sec=decoder_output.inference_time_sec,
-                graph=graph,
-            )
+        if has_route:
+            try:
+                point_gt_df = assign_point_ground_truth(
+                    trip_id=trip_id,
+                    track_df=clean_track,
+                    route_df=trip_data["route"],
+                    nodes_df=nodes_df,
+                    arcs_df=arcs_df,
+                )
+            except Exception:
+                point_gt_df = None
+            if point_gt_df is not None:
+                truth = point_gt_df.set_index("obs_idx")["true_arc_id"]
+                labelled = scored_candidates.copy()
+                ref = labelled["obs_idx"].map(truth)
+                labelled["is_target"] = np.where(
+                    ref.isna(), -1, (labelled["candidate_arc_id"] == ref.fillna(-1)).astype(int)
+                )
+                metrics = evaluate_predictions(
+                    point_gt_df=point_gt_df,
+                    pred_arcs=decoder_output.point_predictions,
+                    arcs_df=arcs_df,
+                    candidates_df=labelled,
+                    inference_time_sec=pipeline_seconds,
+                    graph=graph,
+                )
+        metrics["decode_time_sec"] = decoder_output.inference_time_sec
 
         # Step 6: Folium Map (Lane C)
         # This map is sent to Laptop 2, so it must NOT contain the reference route
         # (ground truth stays server-side). Reference-vs-predicted maps for the
         # report are produced offline by lane C's compare_hmm / folium_maps.
+        display_route = getattr(decoder_output, "connected_route", None) or decoder_output.reconstructed_route
         folium_map = create_route_map(
             track_df=clean_track,
             nodes_df=nodes_df,
             arcs_df=arcs_df,
-            predicted_arcs=decoder_output.reconstructed_route,
+            predicted_arcs=display_route,
             reference_route=None,
+            show_network=False,
         )
         map_html = render_map_html(folium_map)
 
@@ -167,7 +184,8 @@ class PathSnapPipeline:
             folium_map_html=map_html,
             # Extra display geometry for the web UI ([lat, lon] order, as Leaflet expects).
             gps=_gps_latlon(clean_track),
-            predicted_route=_route_polylines(decoder_output.reconstructed_route, nodes_df, arcs_df),
+            predicted_route=_route_polylines(display_route, nodes_df, arcs_df),
+            decoder_mode=decoder_mode,
         )
 
 
