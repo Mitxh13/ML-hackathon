@@ -8,8 +8,7 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 from src.contracts.schemas import CANDIDATE_BASE_COLS, validate_candidate_df
-from src.lane_a_data.preprocessing import project_coordinates
-from src.lane_c_hmm.road_graph import haversine_distance_m
+from src.lane_a_data.preprocessing import haversine_distance_m, project_coordinates
 
 
 class CandidateGenerator:
@@ -38,30 +37,35 @@ class CandidateGenerator:
             trip_id: Identifier of the trip.
             track_df: Track DataFrame with ['gps_lon', 'gps_lat', 'timestamp'].
             nodes_df: Road nodes DataFrame.
-            arcs_df: Road arcs DataFrame.
+            arcs_df: Road arcs connectivity DataFrame.
             point_gt_df: Optional ground-truth point table with 'true_arc_id'.
 
         Returns:
             DataFrame adhering to Contract 1 (CANDIDATE_BASE_COLS).
         """
-        # Ensure projected coordinates
-        proj_nodes = project_coordinates(nodes_df, lon_col="lon", lat_col="lat")
-        proj_track = project_coordinates(track_df, lon_col="gps_lon", lat_col="gps_lat")
+        proj_nodes = (
+            nodes_df
+            if "x_m" in nodes_df.columns
+            else project_coordinates(nodes_df, lon_col="lon", lat_col="lat")
+        )
+        proj_track = (
+            track_df
+            if "x_m" in track_df.columns
+            else project_coordinates(track_df, lon_col="gps_lon", lat_col="gps_lat")
+        )
 
-        # Compute midpoints of all arcs in projected meters
-        u_nodes = arcs_df.iloc[:, 0].values
-        v_nodes = arcs_df.iloc[:, 1].values
+        u_nodes = arcs_df.iloc[:, 0].values.astype(int)
+        v_nodes = arcs_df.iloc[:, 1].values.astype(int)
 
-        u_x = proj_nodes.iloc[u_nodes]["x_m"].values
-        u_y = proj_nodes.iloc[u_nodes]["y_m"].values
-        v_x = proj_nodes.iloc[v_nodes]["x_m"].values
-        v_y = proj_nodes.iloc[v_nodes]["y_m"].values
+        u_x = proj_nodes["x_m"].values[u_nodes]
+        u_y = proj_nodes["y_m"].values[u_nodes]
+        v_x = proj_nodes["x_m"].values[v_nodes]
+        v_y = proj_nodes["y_m"].values[v_nodes]
 
         arc_mid_x = (u_x + v_x) / 2.0
         arc_mid_y = (u_y + v_y) / 2.0
         arc_tree = cKDTree(np.column_stack([arc_mid_x, arc_mid_y]))
 
-        # Map true_arc_id by obs_idx if ground truth provided
         gt_map = {}
         if point_gt_df is not None and "true_arc_id" in point_gt_df.columns:
             gt_map = dict(zip(point_gt_df["obs_idx"], point_gt_df["true_arc_id"]))
@@ -72,10 +76,12 @@ class CandidateGenerator:
         lons = track_df["gps_lon"].values
         lats = track_df["gps_lat"].values
         times = track_df["timestamp"].values
-        obs_indices = track_df["obs_idx"].values if "obs_idx" in track_df.columns else np.arange(len(track_df))
+        obs_indices = (
+            track_df["obs_idx"].values
+            if "obs_idx" in track_df.columns
+            else np.arange(len(track_df))
+        )
 
-        # Query KDTree
-        # Use slightly larger search window in tree to ensure coverage after perpendicular refinement
         search_radius = self.max_dist_m * 1.5
 
         for t in range(len(track_df)):
@@ -84,41 +90,37 @@ class CandidateGenerator:
             obs_idx = int(obs_indices[t])
             true_arc = gt_map.get(obs_idx, None)
 
-            # Query nearby arc midpoints
             nearby_indices = arc_tree.query_ball_point([pt_x, pt_y], r=search_radius)
 
             if not nearby_indices:
-                # Fallback to nearest neighbor
                 _, nearest = arc_tree.query([pt_x, pt_y], k=1)
                 nearby_indices = [int(nearest)]
 
-            # Compute precise geodesic distances to candidate segments
             scored_candidates = []
             for arc_id in nearby_indices:
-                u_id = int(u_nodes[arc_id])
-                v_id = int(v_nodes[arc_id])
-                u_lon = float(nodes_df.iloc[u_id]["lon"])
-                u_lat = float(nodes_df.iloc[u_id]["lat"])
-                v_lon = float(nodes_df.iloc[v_id]["lon"])
-                v_lat = float(nodes_df.iloc[v_id]["lat"])
+                ax, ay = u_x[arc_id], u_y[arc_id]
+                bx, by = v_x[arc_id], v_y[arc_id]
 
-                # Distance to segment endpoints and midpoint
-                d_u = haversine_distance_m(p_lon, p_lat, u_lon, u_lat)
-                d_v = haversine_distance_m(p_lon, p_lat, v_lon, v_lat)
-                d_mid = haversine_distance_m(p_lon, p_lat, (u_lon + v_lon) / 2.0, (u_lat + v_lat) / 2.0)
-                dist_m = min(d_u, d_v, d_mid)
+                dx = bx - ax
+                dy = by - ay
+                l2 = max(dx * dx + dy * dy, 1e-6)
+
+                alpha = np.clip(((pt_x - ax) * dx + (pt_y - ay) * dy) / l2, 0.0, 1.0)
+                qx = ax + alpha * dx
+                qy = ay + alpha * dy
+                dist_m = float(np.sqrt((pt_x - qx) ** 2 + (pt_y - qy) ** 2))
 
                 if dist_m <= self.max_dist_m:
-                    scored_candidates.append((dist_m, arc_id, u_id, v_id))
+                    scored_candidates.append(
+                        (dist_m, arc_id, int(u_nodes[arc_id]), int(v_nodes[arc_id]))
+                    )
 
             if not scored_candidates:
-                # If all were beyond max_dist_m, take the closest 1
                 arc_id = nearby_indices[0]
                 scored_candidates.append(
                     (search_radius, arc_id, int(u_nodes[arc_id]), int(v_nodes[arc_id]))
                 )
 
-            # Sort by distance and retain top k
             scored_candidates.sort(key=lambda x: x[0])
             top_k = scored_candidates[: self.max_k]
 
