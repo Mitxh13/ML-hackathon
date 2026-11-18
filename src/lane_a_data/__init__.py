@@ -1,34 +1,27 @@
-"""Lane A: Data processing, EDA, candidate generation, and feature extraction."""
+"""Lane A data utilities, imported lazily to keep core loaders lightweight."""
+from __future__ import annotations
 
-from src.lane_a_data.loaders import (
-    load_track,
-    load_nodes,
-    load_arcs,
-    load_route,
-    load_trip,
-)
-from src.lane_a_data.preprocessing import project_coordinates, preprocess_track
-from src.lane_a_data.ground_truth import assign_point_ground_truth
-from src.lane_a_data.candidates import CandidateGenerator
-from src.lane_a_data.features import extract_candidate_features
-from src.lane_a_data.eda_plots import (
-    plot_missing_values,
-    plot_speed_distribution,
-    plot_candidate_distances,
-)
+_EXPORTS = {
+    "load_track": ("loaders", "load_track"), "load_nodes": ("loaders", "load_nodes"),
+    "load_arcs": ("loaders", "load_arcs"), "load_route": ("loaders", "load_route"),
+    "load_trip": ("loaders", "load_trip"),
+    "project_coordinates": ("preprocessing", "project_coordinates"),
+    "preprocess_track": ("preprocessing", "preprocess_track"),
+    "assign_point_ground_truth": ("ground_truth", "assign_point_ground_truth"),
+    "CandidateGenerator": ("candidates", "CandidateGenerator"),
+    "extract_candidate_features": ("features", "extract_candidate_features"),
+    "plot_missing_values": ("eda_plots", "plot_missing_values"),
+    "plot_speed_distribution": ("eda_plots", "plot_speed_distribution"),
+    "plot_candidate_distances": ("eda_plots", "plot_candidate_distances"),
+}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    "load_track",
-    "load_nodes",
-    "load_arcs",
-    "load_route",
-    "load_trip",
-    "project_coordinates",
-    "preprocess_track",
-    "assign_point_ground_truth",
-    "CandidateGenerator",
-    "extract_candidate_features",
-    "plot_missing_values",
-    "plot_speed_distribution",
-    "plot_candidate_distances",
-]
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+    module, attr = _EXPORTS[name]
+    value = getattr(import_module(f"{__name__}.{module}"), attr)
+    globals()[name] = value
+    return value
