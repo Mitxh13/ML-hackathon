@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
+import numpy as np
 import pandas as pd
 
 from src.contracts.schemas import DecoderOutput, EvaluationResponse
@@ -145,13 +146,15 @@ class PathSnapPipeline:
             )
 
         # Step 6: Folium Map (Lane C)
-        ref_route = trip_data["route"]["arc_id"].values.tolist() if has_route else None
+        # This map is sent to Laptop 2, so it must NOT contain the reference route
+        # (ground truth stays server-side). Reference-vs-predicted maps for the
+        # report are produced offline by lane C's compare_hmm / folium_maps.
         folium_map = create_route_map(
             track_df=clean_track,
             nodes_df=nodes_df,
             arcs_df=arcs_df,
             predicted_arcs=decoder_output.reconstructed_route,
-            reference_route=ref_route,
+            reference_route=None,
         )
         map_html = render_map_html(folium_map)
 
@@ -162,4 +165,21 @@ class PathSnapPipeline:
             reconstructed_route=decoder_output.reconstructed_route,
             metrics=metrics,
             folium_map_html=map_html,
+            # Extra display geometry for the web UI ([lat, lon] order, as Leaflet expects).
+            gps=_gps_latlon(clean_track),
+            predicted_route=_route_polylines(decoder_output.reconstructed_route, nodes_df, arcs_df),
         )
+
+
+def _gps_latlon(track_df: pd.DataFrame) -> list[list[float]]:
+    """GPS observations as [lat, lon] pairs (input data, not ground truth)."""
+    return np.round(track_df[["gps_lat", "gps_lon"]].to_numpy(dtype=float), 6).tolist()
+
+
+def _route_polylines(route: list[int], nodes_df: pd.DataFrame, arcs_df: pd.DataFrame) -> list[list[list[float]]]:
+    """Predicted arcs as [[lat, lon], [lat, lon]] segments. Row index == arc_id / node_id."""
+    if not route:
+        return []
+    arcs = arcs_df[["from_node_id", "to_node_id"]].to_numpy(dtype=np.int64)[np.asarray(route, dtype=np.int64)]
+    latlon = nodes_df[["lat", "lon"]].to_numpy(dtype=float)
+    return np.round(np.stack([latlon[arcs[:, 0]], latlon[arcs[:, 1]]], axis=1), 6).tolist()
