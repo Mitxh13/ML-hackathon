@@ -1,0 +1,28 @@
+# PathSnap: Distributed Map-Matching & Route Reconstruction
+# Default Configuration
+
+candidate_generation:
+  max_candidate_dist_m: 100.0
+  max_candidates_k: 10
+
+hmm:
+  sigma_emission_m: 15.0
+  beta_transition_m: 30.0
+  unconnected_penalty: -20.0
+  large_gap_threshold_s: 5.0
+
+api:
+  api_host: "0.0.0.0"
+  api_port: 8000
+
+paths:
+  data_dir: "data"
+  train_dir: "data/train"
+  student_test_dir: "data/student_test"
+  evaluator_test_dir: "data/evaluator_test"
+  processed_dir: "data/processed"
+  models_dir: "artifacts/models"
+  logs_dir: "artifacts/logs"
+  tables_dir: "results/tables"
+  figures_dir: "results/figures"
+  maps_dir: "results/maps"
