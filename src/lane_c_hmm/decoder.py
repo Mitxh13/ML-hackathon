@@ -18,7 +18,9 @@ Transition score (log scale, per pair of states at t-1 and t)
         d_gc    = straight-line distance between GPS fixes t-1 and t (metres)
         d_route = distance along the road network from the projection of fix t-1 on arc i
                   to the projection of fix t on arc j (rest of arc i + shortest path + part
-                  of arc j; on the same arc, the distance between the two projections)
+                  of arc j). On the same arc it is the signed distance between the two
+                  projections, so moving backwards on a one-way arc is penalised, unless
+                  ``backward_tolerant`` = 1 treats it as GPS noise (chosen by tuning).
         log T   = -|d_route - d_gc| / beta_t
     Road paths are searched only up to ``max_speed_mps * dt + search_slack_m`` metres (capped
     at ``max_search_m``). If arc j cannot be reached from arc i inside that bound, the pair is
@@ -84,6 +86,7 @@ class HMMParams:
     max_search_m: float = 3000.0
     large_gap_s: float = 5.0
     break_gap_s: float = 120.0
+    backward_tolerant: float = 0.0  # 1: backwards movement on the same arc is GPS noise (|progress|)
 
     @classmethod
     def from_dict(cls, values: Optional[Dict[str, Any]]) -> "HMMParams":
@@ -106,6 +109,7 @@ class Trellis:
     prob: List[Optional[np.ndarray]]         # per step: classifier probability or None
     dt: np.ndarray                           # per step: seconds since previous step
     route_gap: List[Optional[np.ndarray]]    # per step t>=1: |d_route - d_gc| (K_{t-1}, K_t), inf = unreachable
+    same_arc: List[Optional[tuple]]          # per step: (i, j, |abs progress - d_gc|) for same-arc pairs
     limit: np.ndarray                        # per step: road-search bound used (metres)
     prep_time_sec: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -162,10 +166,12 @@ class ViterbiRouteDecoder:
         limit = np.minimum(p.max_speed_mps * np.maximum(dt, 1.0) + p.search_slack_m, p.max_search_m)
         frm, to, length = graph.arc_from, graph.arc_to, graph.arc_length_m
         route_gap: List[Optional[np.ndarray]] = [None]
+        same_arc: List[Optional[tuple]] = [None]
         for t in range(1, n):
             a_prev, a_cur = arcs[t - 1], arcs[t]
             if dt[t] > p.break_gap_s:
                 route_gap.append(None)
+                same_arc.append(None)
                 continue
             rest = length[a_prev] - pos[t - 1]
             d_route = np.full((len(a_prev), len(a_cur)), np.inf)
@@ -177,10 +183,15 @@ class ViterbiRouteDecoder:
                 d_route[i] = rest[i] + sp + pos[t]
                 same = a_cur == ai
                 if same.any():
-                    d_route[i, same] = np.abs(pos[t][same] - pos[t - 1][i])
+                    # signed progress: going backwards on a one-way arc counts against the pair
+                    # (|negative progress - d_gc| = backwards metres + GPS metres), so a fix that
+                    # moves forward cannot sit on the reverse-direction twin for free
+                    d_route[i, same] = pos[t][same] - pos[t - 1][i]
             route_gap.append(np.abs(d_route - gc[t]))
+            ii, jj = np.nonzero(a_prev[:, None] == a_cur[None, :])
+            same_arc.append((ii, jj, np.abs(np.abs(d_route[ii, jj]) - gc[t])) if len(ii) else None)
         return Trellis(trip_id=trip_id, obs_idx=all_obs, step_obs=step_obs, arcs=arcs, dist=dists,
-                       prob=probs, dt=dt, route_gap=route_gap, limit=limit,
+                       prob=probs, dt=dt, route_gap=route_gap, same_arc=same_arc, limit=limit,
                        prep_time_sec=time.perf_counter() - t0)
 
     # ------------------------------------------------------------------ scores
@@ -196,6 +207,10 @@ class ViterbiRouteDecoder:
         if gap is None:
             return None  # chain restart after a very long gap
         p = self.params
+        if p.backward_tolerant and trellis.same_arc[t] is not None:
+            ii, jj, tolerant = trellis.same_arc[t]
+            gap = gap.copy()
+            gap[ii, jj] = tolerant
         beta = p.beta_m * max(1.0, trellis.dt[t] / p.large_gap_s)
         disconnected = -trellis.limit[t] / beta - p.disconnected_penalty
         return np.where(np.isfinite(gap), -gap / beta, disconnected)

@@ -31,6 +31,7 @@ Outputs
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import time
 from pathlib import Path
@@ -63,7 +64,8 @@ MODE_LABEL = {"ml_hmm": "Classifier + HMM", "classifier_only": "Classifier only"
 MODE_COLOUR = {"ml_hmm": "#2a78d6", "classifier_only": "#eb6834", "distance_hmm": "#1baf7a", "nearest": "#eda100"}
 INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
 BETA_FACTORS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
-PENALTIES = (0.0, 5.0, 15.0, 40.0)
+PENALTIES = (0.0, 5.0, 15.0, 40.0, 100.0)
+BACKWARD = (0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------- data
@@ -221,32 +223,37 @@ def summarise(per_trip: pd.DataFrame, trips: List[dict]) -> pd.DataFrame:
 
 
 def tune(trips: List[dict], mode: str, base: HMMParams, est: Dict[str, float]) -> tuple[HMMParams, pd.DataFrame]:
-    """Grid search of beta x disconnected penalty on training trips (Top-1, then continuity)."""
+    """Grid search on training trips: beta x disconnected penalty x backward handling.
+
+    Selection: highest observation Top-1, then adjacent-arc continuity, then the smaller beta.
+    """
     rows = []
-    for factor in BETA_FACTORS:
-        for penalty in PENALTIES:
-            params = HMMParams(**{**base.to_dict(), "beta_m": est["beta_m"] * factor, "disconnected_penalty": penalty})
-            dec = ViterbiRouteDecoder(params)
-            t0 = time.perf_counter()
-            correct = labelled = cont = trans = 0
-            for trip in trips:
-                p = dec.predict_arcs(trip["trellis"], mode)["point_predictions"]
-                truth = trip["gt"]["true_arc_id"]
-                ok = truth.notna().to_numpy()
-                correct += int((p[ok] == truth[ok].to_numpy(np.int64)).sum())
-                labelled += int(ok.sum())
-                flags = continuity_flags(p, trip["raw"]["arcs"])  # adjacency-only: fast, same for all trials
-                cont += int(flags.sum())
-                trans += len(flags)
-            rows.append({"mode": mode, "beta_factor": factor, "beta_m": params.beta_m, "disconnected_penalty": penalty,
-                         "sigma_m": params.sigma_m, "train_top1": correct / labelled,
-                         "train_adjacent_continuity_pct": 100.0 * cont / trans, "seconds": time.perf_counter() - t0})
-            print(f"[tune {mode}] beta {params.beta_m:6.2f} penalty {penalty:4.0f} -> top1 {correct / labelled:.4f}")
+    for factor, penalty, backward in itertools.product(BETA_FACTORS, PENALTIES, BACKWARD):
+        params = HMMParams(**{**base.to_dict(), "beta_m": est["beta_m"] * factor, "disconnected_penalty": penalty,
+                              "backward_tolerant": backward})
+        dec = ViterbiRouteDecoder(params)
+        t0 = time.perf_counter()
+        correct = labelled = cont = trans = 0
+        for trip in trips:
+            p = dec.predict_arcs(trip["trellis"], mode)["point_predictions"]
+            truth = trip["gt"]["true_arc_id"]
+            ok = truth.notna().to_numpy()
+            correct += int((p[ok] == truth[ok].to_numpy(np.int64)).sum())
+            labelled += int(ok.sum())
+            flags = continuity_flags(p, trip["raw"]["arcs"])  # adjacency-only: fast, same for all trials
+            cont += int(flags.sum())
+            trans += len(flags)
+        rows.append({"mode": mode, "beta_factor": factor, "beta_m": params.beta_m, "disconnected_penalty": penalty,
+                     "backward_tolerant": backward, "sigma_m": params.sigma_m, "train_top1": correct / labelled,
+                     "train_adjacent_continuity_pct": 100.0 * cont / trans, "seconds": time.perf_counter() - t0})
+        print(f"[tune {mode}] beta {params.beta_m:6.2f} penalty {penalty:4.0f} backward_tolerant {backward:.0f} "
+              f"-> top1 {correct / labelled:.4f}")
     trials = pd.DataFrame(rows)
     best = trials.sort_values(["train_top1", "train_adjacent_continuity_pct", "beta_factor"],
                               ascending=[False, False, True]).iloc[0]
     tuned = HMMParams(**{**base.to_dict(), "beta_m": float(best["beta_m"]),
-                         "disconnected_penalty": float(best["disconnected_penalty"])})
+                         "disconnected_penalty": float(best["disconnected_penalty"]),
+                         "backward_tolerant": float(best["backward_tolerant"])})
     return tuned, trials
 
 
@@ -282,8 +289,9 @@ def make_figures(summary: pd.DataFrame, per_trip: pd.DataFrame, trials: pd.DataF
         vals = s[col].to_numpy(float) * scale
         x = np.arange(len(order))
         ax.bar(x, vals, width=0.62, color=[MODE_COLOUR[m] for m in order], edgecolor=SURFACE, linewidth=2)
+        decimals = 2 if col == "route_continuity_pct" else 1  # 99.97 must not print as 100.0
         for xi, v in zip(x, vals):
-            ax.text(xi, v + 1.2, f"{v:.1f}%", ha="center", va="bottom", fontsize=9, color=INK)
+            ax.text(xi, v + 1.2, f"{v:.{decimals}f}%", ha="center", va="bottom", fontsize=9, color=INK)
         ax.set_xticks(x, [MODE_LABEL[m].replace(" + ", "\n+ ").replace(" ", "\n", 1) if len(MODE_LABEL[m]) > 12
                           else MODE_LABEL[m] for m in order], fontsize=8.5)
         ax.set_ylim(0, 108)
@@ -324,7 +332,10 @@ def make_figures(summary: pd.DataFrame, per_trip: pd.DataFrame, trials: pd.DataF
     modes = [m for m in ("ml_hmm", "distance_hmm") if m in set(trials["mode"])]
     fig, axes = plt.subplots(1, len(modes), figsize=(5.4 * len(modes), 3.6), facecolor=SURFACE, squeeze=False)
     for ax, mode in zip(axes[0], modes):
-        grid = trials[trials["mode"] == mode].pivot(index="disconnected_penalty", columns="beta_m", values="train_top1") * 100
+        sub = trials[trials["mode"] == mode]
+        backward = sub.loc[sub["train_top1"].idxmax(), "backward_tolerant"]  # show the slice holding the optimum
+        grid = sub[sub["backward_tolerant"] == backward].pivot(
+            index="disconnected_penalty", columns="beta_m", values="train_top1") * 100
         im = ax.imshow(grid.to_numpy(), cmap="Blues", aspect="auto", origin="lower")
         best = np.unravel_index(np.nanargmax(grid.to_numpy()), grid.shape)
         for (i, j), v in np.ndenumerate(grid.to_numpy()):
@@ -335,7 +346,8 @@ def make_figures(summary: pd.DataFrame, per_trip: pd.DataFrame, trials: pd.DataF
         ax.set_yticks(range(grid.shape[0]), [f"{p:.0f}" for p in grid.index], fontsize=8.5)
         ax.set_xlabel("beta (m)", color=INK2, fontsize=9)
         ax.set_ylabel("disconnected penalty", color=INK2, fontsize=9)
-        ax.set_title(f"{MODE_LABEL[mode]}: training Top-1 (%)", fontsize=10.5, color=INK, loc="left")
+        ax.set_title(f"{MODE_LABEL[mode]}: training Top-1 (%), backward_tolerant = {backward:.0f}",
+                     fontsize=10.5, color=INK, loc="left")
         fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02).ax.tick_params(labelsize=8, colors=INK2)
     fig.tight_layout()
     paths.append(fig_dir / "hmm_tuning_heatmap.png")
@@ -418,7 +430,7 @@ def main() -> None:
             "selected_on": "80 training trips, out-of-fold classifier probabilities (GroupKFold by trip)",
             "objective": "observation-level Top-1 accuracy (ties: adjacent-arc continuity)",
             "estimated_sigma_m": est["sigma_m"], "estimated_beta_m": est["beta_m"],
-            "beta_factors": list(BETA_FACTORS), "penalties": list(PENALTIES),
+            "beta_factors": list(BETA_FACTORS), "penalties": list(PENALTIES), "backward_tolerant": list(BACKWARD),
             "evaluator_test_used": False,
         },
     }
@@ -481,8 +493,10 @@ def main() -> None:
         "evaluator-test trips were not read.",
         "",
         f"Estimated from training reference paths: sigma = {est['sigma_m']:.2f} m, beta = {est['beta_m']:.2f} m.",
-        f"Tuned ml_hmm: beta = {tuned_ml.beta_m:.2f} m, disconnected penalty = {tuned_ml.disconnected_penalty:g}. "
-        f"Tuned distance_hmm: beta = {tuned_dist.beta_m:.2f} m, disconnected penalty = {tuned_dist.disconnected_penalty:g}.",
+        f"Tuned ml_hmm: beta = {tuned_ml.beta_m:.2f} m, disconnected penalty = {tuned_ml.disconnected_penalty:g}, "
+        f"backward_tolerant = {tuned_ml.backward_tolerant:g}. "
+        f"Tuned distance_hmm: beta = {tuned_dist.beta_m:.2f} m, disconnected penalty = {tuned_dist.disconnected_penalty:g}, "
+        f"backward_tolerant = {tuned_dist.backward_tolerant:g}.",
         "",
         "| Decoder | Train Top-1 (OOF) | Student Top-1 | Student macro F1 (obs) | Student continuity | Student route F1 | Decode s/trip |",
         "|---|---|---|---|---|---|---|",

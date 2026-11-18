@@ -200,3 +200,17 @@ def test_route_map_has_layers_and_keeps_reference_optional():
         assert name in html
     ui_html = render_map_html(create_route_map(track, nodes, arcs, predicted_arcs=[0, 1]))
     assert "Reference route" not in ui_html
+
+
+def test_signed_progress_rejects_the_reverse_twin_unless_tolerant():
+    # One two-way street: arc 0 eastbound, arc 1 westbound on the same line. The car drives
+    # east, but the classifier slightly prefers the westbound twin at every fix.
+    lon, lat = lonlat([0.0, 200.0], [0.0, 0.0])
+    nodes = pd.DataFrame({"lon": lon, "lat": lat})
+    arcs = pd.DataFrame({"from_node_id": [0, 1], "to_node_id": [1, 0]})
+    pts = [(20.0 + 10 * i, 2.0) for i in range(9)]
+    cands = candidates_for(pts, range(9), [[(0, 2.0), (1, 2.0)]] * 9, [[0.45, 0.55]] * 9)
+    strict = ViterbiRouteDecoder(HMMParams(beta_m=5.0, backward_tolerant=0.0))
+    tolerant = ViterbiRouteDecoder(HMMParams(beta_m=5.0, backward_tolerant=1.0))
+    assert strict.decode_trip(cands, nodes, arcs, mode="ml_hmm").point_predictions == [0] * 9
+    assert tolerant.decode_trip(cands, nodes, arcs, mode="ml_hmm").point_predictions == [1] * 9

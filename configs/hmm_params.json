@@ -1,0 +1,53 @@
+{
+  "ml_hmm": {
+    "sigma_m": 7.406131221459535,
+    "beta_m": 0.8910864401577285,
+    "emission_weight": 1.0,
+    "disconnected_penalty": 0.0,
+    "max_speed_mps": 50.0,
+    "search_slack_m": 200.0,
+    "max_search_m": 3000.0,
+    "large_gap_s": 5.0,
+    "break_gap_s": 120.0,
+    "backward_tolerant": 1.0
+  },
+  "distance_hmm": {
+    "sigma_m": 7.406131221459535,
+    "beta_m": 3.564345760630914,
+    "emission_weight": 1.0,
+    "disconnected_penalty": 5.0,
+    "max_speed_mps": 50.0,
+    "search_slack_m": 200.0,
+    "max_search_m": 3000.0,
+    "large_gap_s": 5.0,
+    "break_gap_s": 120.0,
+    "backward_tolerant": 1.0
+  },
+  "provenance": {
+    "model": "XGBoost",
+    "selected_on": "80 training trips, out-of-fold classifier probabilities (GroupKFold by trip)",
+    "objective": "observation-level Top-1 accuracy (ties: adjacent-arc continuity)",
+    "estimated_sigma_m": 7.406131221459535,
+    "estimated_beta_m": 1.782172880315457,
+    "beta_factors": [
+      0.25,
+      0.5,
+      1.0,
+      2.0,
+      4.0,
+      8.0
+    ],
+    "penalties": [
+      0.0,
+      5.0,
+      15.0,
+      40.0,
+      100.0
+    ],
+    "backward_tolerant": [
+      0.0,
+      1.0
+    ],
+    "evaluator_test_used": false
+  }
+}
