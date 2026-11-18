@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PathSnap Evaluator</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230F2A43'/><path d='M7 23 L13 15 L19 18 L25 9' fill='none' stroke='%23F2B33D' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="appbar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="6"/><path d="M7 23 L13 15 L19 18 L25 9"/></svg>
+      <span class="name">PathSnap</span>
+      <span class="sub">Map-matching evaluator</span>
+    </div>
+
+    <div class="conn">
+      <button id="connBtn" class="conn-btn" aria-expanded="false" aria-controls="connPanel">
+        <span id="connDot" class="dot" aria-hidden="true"></span>
+        <span id="connText">Connecting</span>
+        <code id="connHost" class="mono-sm"></code>
+      </button>
+      <form id="connPanel" class="popover" hidden>
+        <label for="apiUrl">API address (Laptop 1)</label>
+        <div class="row">
+          <input id="apiUrl" type="url" spellcheck="false" placeholder="http://192.168.1.20:8000" autocomplete="off">
+          <button type="submit" class="btn btn-primary">Connect</button>
+        </div>
+        <p class="help" id="connInfo">Not checked yet.</p>
+      </form>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Trips -->
+    <section class="panel trips" aria-labelledby="tripsTitle">
+      <div class="panel-head">
+        <h2 id="tripsTitle">Trips</h2>
+        <span class="count mono-sm" id="tripCount">0</span>
+      </div>
+      <div class="tabs" id="partitionTabs" role="tablist" hidden></div>
+      <ul id="tripList" class="trip-list" role="listbox" aria-label="Trips"></ul>
+      <div class="panel-foot">
+        <button id="runBtn" class="btn btn-primary btn-block" disabled>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 4l10 6-10 6z"/></svg>
+          <span id="runLabel">Select a trip</span>
+        </button>
+        <button id="runAllBtn" class="btn btn-secondary btn-block" disabled>Run all trips</button>
+      </div>
+    </section>
+
+    <!-- Map -->
+    <section class="panel mapcard" id="mapRegion" aria-label="Route map" aria-busy="false">
+      <div id="map"></div>
+
+      <div class="progress" id="progress" hidden role="status" aria-live="polite">
+        <div class="bar-indeterminate" aria-hidden="true"></div>
+        <span id="progressText">Processing</span>
+        <code class="mono-sm" id="progressTime">0.0 s</code>
+      </div>
+
+      <div class="map-title" id="mapTitle" hidden>
+        <span class="label">Trip</span>
+        <code id="mapTrip">-</code>
+      </div>
+
+      <fieldset class="legend">
+        <legend class="sr-only">Map layers</legend>
+        <label><input type="checkbox" id="tgRoute" checked><span class="sw sw-route"></span>Predicted route</label>
+        <label><input type="checkbox" id="tgGps" checked><span class="sw sw-gps"></span>GPS observations</label>
+        <label><input type="checkbox" id="tgEnds" checked><span class="sw sw-ends"></span>Start / end</label>
+      </fieldset>
+
+      <div class="empty" id="emptyMap">
+        <p class="empty-title">No trip loaded</p>
+        <p>Select a trip on the left and run it. The trip is sent to the API on Laptop 1, and the predicted route is drawn here.</p>
+      </div>
+    </section>
+
+    <!-- Results -->
+    <section class="panel results" aria-labelledby="resTitle">
+      <div class="panel-head">
+        <h2 id="resTitle">Results</h2>
+        <span class="model-tag mono-sm" id="modelTag" hidden></span>
+      </div>
+
+      <p id="resEmpty" class="note">Scores are computed on Laptop 1 against its reference data. Only the numbers are sent here, never the reference route.</p>
+
+      <div id="resBody" hidden>
+        <div class="kpi-hero">
+          <span class="kpi-label" id="heroLabel">Top-1 accuracy</span>
+          <span class="kpi-big mono" id="heroVal">-</span>
+          <div class="meter" aria-hidden="true"><i id="heroBar"></i></div>
+        </div>
+        <dl class="kpis" id="kpis"></dl>
+      </div>
+
+      <div class="session">
+        <div class="panel-head sub">
+          <h3>Session</h3>
+          <span class="tools">
+            <span class="help mono-sm" id="sessHint">0 / 0</span>
+            <button id="csvBtn" class="btn btn-ghost btn-xs" disabled>Export CSV</button>
+          </span>
+        </div>
+        <div class="table-wrap">
+          <table class="sess-table">
+            <thead><tr><th scope="col">Trip</th><th scope="col" class="num">Top-1</th><th scope="col" class="num">Cont.</th><th scope="col" class="num">Time</th></tr></thead>
+            <tbody id="sessRows"><tr class="empty-row"><td colspan="4">No runs yet</td></tr></tbody>
+            <tfoot id="sessFoot" hidden><tr><th scope="row">Mean</th><td class="num" id="meanTop1"></td><td class="num" id="meanCont"></td><td class="num" id="meanTime"></td></tr></tfoot>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
